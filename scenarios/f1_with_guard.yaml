@@ -1,0 +1,18 @@
+name: "Fault F1 Response Drop With RAPTOR Guard Proxy"
+version: "1.0"
+seed: 303
+repetitions: 3
+use_guard: true
+stack:
+  type: "raw_mcp"
+  max_retries: 1
+  backoff_seconds: 0.05
+workload:
+  type: "transfer"
+  amount: 80.0
+  recipient: "VendorAccount"
+  memo_prefix: "f1_guard_tx"
+fault:
+  type: "f1_response_drop"
+  parameters:
+    timeout_ms: 10

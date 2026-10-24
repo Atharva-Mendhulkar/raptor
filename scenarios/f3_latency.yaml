@@ -1,0 +1,19 @@
+name: "Fault F3 Latency and Jitter"
+version: "1.0"
+seed: 404
+repetitions: 3
+use_guard: false
+stack:
+  type: "raw_mcp"
+  max_retries: 0
+  timeout_seconds: 5.0
+workload:
+  type: "transfer"
+  amount: 25.0
+  recipient: "SlowAccount"
+  memo_prefix: "f3_latency_tx"
+fault:
+  type: "f3_latency"
+  parameters:
+    latency_ms: 150
+    jitter_ms: 30

@@ -9,14 +9,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import sys
 import time
 from typing import Any, Dict, List, Optional
 import uvicorn
 import yaml
 from pydantic import BaseModel, Field
 
+from raptor.analyzer.metrics import AnalysisReport, StatisticalAnalyzer
 from raptor.clients.raw_mcp_client import RawMCPClientAdapter
 from raptor.clients.react_agent import ReActAgentAdapter
+from raptor.guard.ledger import GuardLedger
+from raptor.guard.policy import GuardPolicyConfig
+from raptor.guard.proxy import GuardProxyApp
 from raptor.harness.oracle import EvaluationResult, Oracle
 from raptor.harness.toxiproxy import ToxiproxyController
 from raptor.server.ledger_db import LedgerDB
@@ -49,6 +54,7 @@ class ScenarioConfig(BaseModel):
     version: str = "1.0"
     seed: int = 42
     repetitions: int = 5
+    use_guard: bool = False
     stack: StackConfig = Field(default_factory=StackConfig)
     workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
     fault: FaultConfig = Field(default_factory=FaultConfig)
@@ -81,6 +87,7 @@ class ScenarioResult(BaseModel):
     phantom_error_count: int
     success_rate: float
     details: List[EvaluationResult]
+    report: Optional[AnalysisReport] = None
 
 
 class ScenarioRunner:
@@ -131,6 +138,32 @@ class ScenarioRunner:
 
             proxy_url = f"http://127.0.0.1:{self.proxy_port}/mcp"
 
+            # Optional Guard Proxy deployment (Experiment E3)
+            guard_task = None
+            guard_srv = None
+            guard_app = None
+            if self.config.use_guard:
+                guard_policy = GuardPolicyConfig.from_yaml_file("raptor/policies/guard_policy.yaml")
+                guard_ledger = GuardLedger()
+                guard_app = GuardProxyApp(
+                    upstream_url=f"http://127.0.0.1:{self.proxy_port}",
+                    policy_config=guard_policy,
+                    ledger=guard_ledger,
+                )
+                guard_port = self.server_port + 2
+                guard_cfg = uvicorn.Config(
+                    guard_app.as_asgi_app(),
+                    host="127.0.0.1",
+                    port=guard_port,
+                    log_level="error",
+                )
+                guard_srv = uvicorn.Server(guard_cfg)
+                guard_task = asyncio.create_task(guard_srv.serve())
+                await asyncio.sleep(0.3)
+                client_url = f"http://127.0.0.1:{guard_port}/mcp"
+            else:
+                client_url = proxy_url
+
             # Execute repetitions
             for i in range(self.config.repetitions):
                 # Deterministic memo derivation
@@ -139,13 +172,13 @@ class ScenarioRunner:
                 # Client initialization
                 if self.config.stack.type == "react_agent":
                     client = ReActAgentAdapter(
-                        endpoint_url=proxy_url,
+                        endpoint_url=client_url,
                         max_agent_steps=self.config.stack.max_retries + 1,
                         client_retries=1,
                     )
                 else:
                     client = RawMCPClientAdapter(
-                        endpoint_url=proxy_url,
+                        endpoint_url=client_url,
                         max_retries=self.config.stack.max_retries,
                         backoff_seconds=self.config.stack.backoff_seconds,
                         timeout_seconds=self.config.stack.timeout_seconds,
@@ -199,6 +232,12 @@ class ScenarioRunner:
             success_count = sum(1 for e in evaluations if e.client_reported_success)
             success_rate = success_count / float(self.config.repetitions) if self.config.repetitions else 0.0
 
+            analyzer = StatisticalAnalyzer(seed=self.config.seed)
+            report = analyzer.analyze(
+                evaluations,
+                plan_meta={"scenario": self.config.name, "seed": self.config.seed, "repetitions": self.config.repetitions},
+            )
+
             return ScenarioResult(
                 scenario_name=self.config.name,
                 seed=self.config.seed,
@@ -209,9 +248,16 @@ class ScenarioRunner:
                 phantom_error_count=phantoms,
                 success_rate=success_rate,
                 details=evaluations,
+                report=report,
             )
 
         finally:
+            if guard_app:
+                await guard_app.close()
+            if guard_srv:
+                guard_srv.should_exit = True
+            if guard_task:
+                await guard_task
             self.toxiproxy.delete_proxy(self.proxy_name)
             srv.should_exit = True
             await server_task
@@ -238,3 +284,28 @@ class ScenarioRunner:
         self.toxiproxy.clear_f3_latency_jitter(self.proxy_name)
         self.toxiproxy.clear_f4_timeout(self.proxy_name)
         self.toxiproxy.clear_connection_reset(self.proxy_name)
+
+
+async def _main() -> None:
+    """CLI execution for ScenarioRunner (Requirement A3)."""
+    if len(sys.argv) < 2:
+        print("Usage: python3 -m raptor.harness.scenario <scenario.yaml>")
+        sys.exit(1)
+
+    scenario_file = sys.argv[1]
+    cfg = ScenarioConfig.from_yaml_file(scenario_file)
+    runner = ScenarioRunner(cfg)
+    result = await runner.run()
+
+    if result.report:
+        print(result.report.to_ascii_table())
+    else:
+        print(
+            f"Scenario: {result.scenario_name} | "
+            f"Multiplicity: {result.multiplicity:.2f} | "
+            f"Duplicates: {result.duplicate_count}"
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
