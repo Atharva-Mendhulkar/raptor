@@ -1,0 +1,17 @@
+name: "Fault F1 Response Drop With SDK Retries"
+version: "1.0"
+seed: 202
+repetitions: 3
+stack:
+  type: "raw_mcp"
+  max_retries: 1
+  backoff_seconds: 0.05
+workload:
+  type: "transfer"
+  amount: 80.0
+  recipient: "VendorAccount"
+  memo_prefix: "f1_drop_tx"
+fault:
+  type: "f1_response_drop"
+  parameters:
+    timeout_ms: 10

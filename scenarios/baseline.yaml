@@ -1,0 +1,15 @@
+name: "Baseline MCP Stack Without Injected Faults"
+version: "1.0"
+seed: 101
+repetitions: 3
+stack:
+  type: "raw_mcp"
+  max_retries: 0
+  backoff_seconds: 0.05
+workload:
+  type: "transfer"
+  amount: 45.0
+  recipient: "Treasury"
+  memo_prefix: "baseline_tx"
+fault:
+  type: "none"
