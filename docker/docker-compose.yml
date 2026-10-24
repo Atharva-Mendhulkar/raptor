@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: raptor_toxiproxy
+    ports:
+      - "8474:8474"
+      - "8970-8980:8970-8980"
+
+  raptor-harness:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.netem
+    container_name: raptor_harness
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TOXIPROXY_URL=http://toxiproxy:8474
+    depends_on:
+      - toxiproxy

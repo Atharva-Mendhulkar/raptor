@@ -13,6 +13,9 @@ from raptor.clients.raw_mcp_client import RawMCPClientAdapter
 from raptor.clients.react_agent import ReActAgentAdapter
 from raptor.clients.langgraph_adapter import LangGraphAgentAdapter
 from raptor.clients.openai_agent_adapter import OpenAIAgentsSDKAdapter
+from raptor.clients.a2a_adapter import A2AClientAdapter
+from raptor.clients.model_agent import ModelAgentAdapter
+from raptor.clients.durable_adapter import DurableExecutionAdapter
 from raptor.server.ledger_db import LedgerDB
 from raptor.server.mock_tool_server import create_mock_mcp_server
 
@@ -47,6 +50,9 @@ async def test_all_stack_adapters_no_fault_success():
             ("ReAct Agent Loop", ReActAgentAdapter(endpoint_url=endpoint_url, max_agent_replans=1)),
             ("LangGraph StateGraph", LangGraphAgentAdapter(endpoint_url=endpoint_url, max_graph_iterations=1)),
             ("OpenAI Agents SDK", OpenAIAgentsSDKAdapter(endpoint_url=endpoint_url, max_agent_turns=1)),
+            ("A2A Protocol Client", A2AClientAdapter(endpoint_url=endpoint_url, max_retries=1)),
+            ("Model Agent W2", ModelAgentAdapter(endpoint_url=endpoint_url, max_re_plans=1)),
+            ("Durable Execution B4", DurableExecutionAdapter(endpoint_url=endpoint_url, max_activity_retries=1)),
         ]
 
         for name, adapter in adapters:

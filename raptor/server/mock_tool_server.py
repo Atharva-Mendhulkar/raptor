@@ -70,4 +70,27 @@ def create_mock_mcp_server(
         })
         raise ToolError(payload)
 
+    @server.tool(
+        name="a2a_send_message",
+        description="A2A SendMessage protocol operation. Carries messageId and task payload.",
+    )
+    def a2a_send_message(message_id: str, amount: float, recipient: str, memo: str) -> str:
+        """Executes an A2A SendMessage task and commits effect to ledger."""
+        record = ledger.record_effect(
+            tool_name="a2a_send_message",
+            logical_op_id=memo,
+            recipient=recipient,
+            amount=amount,
+            meta={"a2a_message_id": message_id},
+        )
+        return json.dumps({
+            "status": "COMMITTED",
+            "task_state": "COMPLETED",
+            "messageId": message_id,
+            "effect_id": record.id,
+            "logical_op_id": memo,
+            "recipient": recipient,
+            "amount": amount,
+        })
+
     return server, ledger

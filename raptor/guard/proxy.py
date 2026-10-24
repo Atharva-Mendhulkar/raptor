@@ -72,6 +72,28 @@ class GuardProxyApp:
             self.upstream_client = httpx.AsyncClient(timeout=self.timeout_seconds)
         return self.upstream_client
 
+    async def _ensure_upstream_session(self) -> str:
+        """Requirement G1: Transparent session auto-negotiation with upstream MCP server."""
+        if getattr(self, "_cached_session_id", None):
+            return self._cached_session_id
+        client = await self._get_client()
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": "init_guard_session",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "raptor-guard-proxy", "version": "0.1.0"},
+            },
+        }
+        try:
+            resp = await client.post(f"{self.upstream_url}/mcp", json=init_payload, timeout=2.0)
+            self._cached_session_id = resp.headers.get("mcp-session-id", "")
+        except Exception:
+            self._cached_session_id = ""
+        return self._cached_session_id
+
     async def close(self) -> None:
         if self.upstream_client and not self.upstream_client.is_closed:
             await self.upstream_client.aclose()
@@ -268,6 +290,10 @@ class GuardProxyApp:
             forward_headers = dict(request.headers)
             forward_headers.pop("host", None)
             forward_headers.pop("content-length", None)
+            if "mcp-session-id" not in forward_headers:
+                sess = await self._ensure_upstream_session()
+                if sess:
+                    forward_headers["mcp-session-id"] = sess
             if deadline_epoch is not None:
                 forward_headers["x-deadline-epoch"] = str(deadline_epoch)
 
@@ -487,6 +513,41 @@ class GuardProxyApp:
                 status_code=502,
             )
 
+    async def handle_a2a(self, request: Request) -> Response:
+        """Route handler for A2A SendMessage protocol endpoint (Requirement G1)."""
+        body_bytes = await request.body()
+        try:
+            payload = json.loads(body_bytes.decode("utf-8"))
+        except Exception:
+            return Response(status_code=400, content=b"Invalid JSON")
+
+        params = payload.get("params", {}) if isinstance(payload, dict) else {}
+        message_id = (
+            params.get("messageId")
+            or params.get("message_id")
+            or payload.get("messageId")
+            or f"a2a_{time.time_ns()}"
+        )
+
+        mcp_like_payload = {
+            "jsonrpc": "2.0",
+            "id": payload.get("id", message_id),
+            "method": "tools/call",
+            "params": {
+                "name": "a2a_send_message",
+                "arguments": {
+                    "message_id": message_id,
+                    "amount": params.get("amount", 0.0),
+                    "recipient": params.get("recipient", ""),
+                    "memo": params.get("memo", ""),
+                    "idempotency_key": message_id,
+                },
+            },
+        }
+        return await self._handle_guarded_tool_call(
+            request, mcp_like_payload, json.dumps(mcp_like_payload).encode("utf-8")
+        )
+
     async def _proxy_passthrough(self, request: Request) -> Response:
         return await self._forward_raw(request, b"")
 
@@ -494,6 +555,7 @@ class GuardProxyApp:
         """Returns the Starlette ASGI application."""
         routes = [
             Route("/mcp", endpoint=self.handle_mcp, methods=["GET", "POST"]),
+            Route("/a2a", endpoint=self.handle_a2a, methods=["POST"]),
             Route("/stats", endpoint=self.handle_stats, methods=["GET"]),
             Route("/{rest_of_path:path}", endpoint=self._proxy_passthrough, methods=["GET", "POST"]),
         ]

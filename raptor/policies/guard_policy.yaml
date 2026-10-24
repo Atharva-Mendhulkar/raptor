@@ -16,3 +16,12 @@ tools:
     scope: "banking"
     status_check_tool: null
     allow_retry: true
+  a2a_send_message:
+    effectful: true
+    idempotent: false
+    idempotency_fields:
+      - "message_id"
+    dedup_window_seconds: 60.0
+    scope: "a2a"
+    status_check_tool: null
+    allow_retry: true
