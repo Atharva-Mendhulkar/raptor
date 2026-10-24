@@ -25,6 +25,7 @@ class ToolPolicyDefinition(BaseModel):
     scope: str = "default"
     status_check_tool: Optional[str] = None
     allow_retry: bool = True
+    min_service_time_seconds: float = 0.05
 
 
 class GuardPolicyConfig(BaseModel):
@@ -71,4 +72,5 @@ class GuardPolicyConfig(BaseModel):
             scope=d.scope,
             status_check_tool=d.status_check_tool,
             allow_retry=d.allow_retry,
+            min_service_time_seconds=d.min_service_time_seconds,
         )

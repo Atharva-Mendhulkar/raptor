@@ -153,11 +153,11 @@ class GuardLedger:
 
             return False
 
-    def mark_committed(self, idempotency_key: str, response_json: str) -> None:
+    def mark_committed(self, idempotency_key: str, response_json: str, tool_name: str = "tool") -> None:
         """Transitions state to COMMITTED and stores the response payload for replay."""
         now = time.time()
         with self._get_connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE guard_ledger
                 SET state = 'COMMITTED', stored_response_json = ?, updated_at = ?
@@ -165,13 +165,21 @@ class GuardLedger:
                 """,
                 (response_json, now, idempotency_key),
             )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """
+                    INSERT INTO guard_ledger (idempotency_key, tool_name, state, stored_response_json, created_at, updated_at)
+                    VALUES (?, ?, 'COMMITTED', ?, ?, ?);
+                    """,
+                    (idempotency_key, tool_name, response_json, now, now),
+                )
             conn.commit()
 
-    def mark_failed_definite(self, idempotency_key: str) -> None:
+    def mark_failed_definite(self, idempotency_key: str, tool_name: str = "tool") -> None:
         """Transitions state to FAILED_DEFINITE (e.g. tool validation error)."""
         now = time.time()
         with self._get_connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE guard_ledger
                 SET state = 'FAILED_DEFINITE', updated_at = ?
@@ -179,13 +187,21 @@ class GuardLedger:
                 """,
                 (now, idempotency_key),
             )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """
+                    INSERT INTO guard_ledger (idempotency_key, tool_name, state, created_at, updated_at)
+                    VALUES (?, ?, 'FAILED_DEFINITE', ?, ?);
+                    """,
+                    (idempotency_key, tool_name, now, now),
+                )
             conn.commit()
 
-    def mark_unknown(self, idempotency_key: str) -> None:
+    def mark_unknown(self, idempotency_key: str, tool_name: str = "tool") -> None:
         """Transitions state to UNKNOWN (e.g. dropped connection, upstream timeout)."""
         now = time.time()
         with self._get_connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE guard_ledger
                 SET state = 'UNKNOWN', updated_at = ?
@@ -193,4 +209,12 @@ class GuardLedger:
                 """,
                 (now, idempotency_key),
             )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """
+                    INSERT INTO guard_ledger (idempotency_key, tool_name, state, created_at, updated_at)
+                    VALUES (?, ?, 'UNKNOWN', ?, ?);
+                    """,
+                    (idempotency_key, tool_name, now, now),
+                )
             conn.commit()

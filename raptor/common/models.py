@@ -48,3 +48,4 @@ class ToolPolicy(BaseModel):
     scope: str = "default"
     status_check_tool: Optional[str] = None
     allow_retry: bool = True
+    min_service_time_seconds: float = 0.05
