@@ -10,10 +10,6 @@ from raptor.harness.toxiproxy import ToxiproxyController
 @pytest.mark.asyncio
 async def test_scenario_yaml_execution_reproducibility():
     """Verify that running the same scenario YAML twice with the same seed yields identical event logs."""
-    controller = ToxiproxyController()
-    if not controller.is_reachable():
-        pytest.skip("Toxiproxy daemon not running on localhost:8474")
-
     yaml_path = "scenarios/f1_response_drop.yaml"
     cfg1 = ScenarioConfig.from_yaml_file(yaml_path)
     cfg2 = ScenarioConfig.from_yaml_file(yaml_path)

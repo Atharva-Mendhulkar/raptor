@@ -29,13 +29,15 @@ class OpenAIAgentsSDKAdapter(BaseClientAdapter):
         endpoint_url: str,
         max_agent_turns: int = 2,
         sdk_transport_retries: int = 1,
+        sdk_retries: Optional[int] = None,
     ):
         super().__init__(endpoint_url)
         self.max_agent_turns = max_agent_turns
-        self.sdk_transport_retries = sdk_transport_retries
+        retries = sdk_retries if sdk_retries is not None else sdk_transport_retries
+        self.sdk_transport_retries = retries
         self._mcp_client = RawMCPClientAdapter(
             endpoint_url=endpoint_url,
-            max_retries=sdk_transport_retries,
+            max_retries=retries,
         )
 
     async def _ensure_initialized(self) -> str:
@@ -86,3 +88,7 @@ class OpenAIAgentsSDKAdapter(BaseClientAdapter):
             attempts_made=total_attempts,
             meta={"agent_turns": turn, "stack": "openai_agents_sdk"},
         )
+
+    async def close(self) -> None:
+        if self._mcp_client:
+            await self._mcp_client.close()

@@ -7,10 +7,6 @@ from raptor.harness.toxiproxy import ToxiproxyController
 @pytest.mark.asyncio
 async def test_smoke_gate_g0_execution():
     """Run Gate G0 runner with 2 trials per condition and verify metrics generation."""
-    controller = ToxiproxyController()
-    if not controller.is_reachable():
-        pytest.skip("Toxiproxy daemon not running on localhost:8474")
-
     runner = G0Runner(server_port=8996, proxy_port=8997)
     summary = await runner.run_experiment(num_trials=2)
 

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from raptor.clients.raw_mcp_client import RawMCPClientAdapter
 from raptor.clients.react_agent import ReActAgentAdapter
 from raptor.clients.behavior_probe import ToolErrorBehaviorProbe
+from raptor.harness.asgi_fault_proxy import ASGIFaultProxy
 from raptor.harness.oracle import EvaluationResult, Oracle
 from raptor.harness.toxiproxy import ToxiproxyController
 from raptor.server.ledger_db import LedgerDB
@@ -49,6 +50,7 @@ class G0Runner:
         self.toxiproxy_api = toxiproxy_api
         self.toxiproxy = ToxiproxyController(self.toxiproxy_api)
         self.proxy_name = "raptor_g0_proxy"
+        self.use_native_proxy = not self.toxiproxy.is_reachable()
 
     async def run_experiment(self, num_trials: int = 5) -> G0ExperimentSummary:
         """Run the complete Gate G0 test suite."""
@@ -72,20 +74,29 @@ class G0Runner:
 
         oracle = Oracle(ledger)
         details: List[EvaluationResult] = []
+        fault_proxy = None
+        fault_srv = None
+        fault_task = None
 
         try:
-            # 3. Setup Toxiproxy
-            if not self.toxiproxy.is_reachable():
-                raise RuntimeError(
-                    f"Toxiproxy daemon is not reachable at {self.toxiproxy_api}. "
-                    "Ensure 'toxiproxy-server' is running."
+            if self.use_native_proxy:
+                fault_proxy = ASGIFaultProxy(upstream_url=f"http://127.0.0.1:{self.server_port}")
+                fault_cfg = uvicorn.Config(
+                    fault_proxy.as_asgi_app(),
+                    host="127.0.0.1",
+                    port=self.proxy_port,
+                    log_level="error",
+                )
+                fault_srv = uvicorn.Server(fault_cfg)
+                fault_task = asyncio.create_task(fault_srv.serve())
+                await asyncio.sleep(0.3)
+            else:
+                self.toxiproxy.create_proxy(
+                    name=self.proxy_name,
+                    listen=f"127.0.0.1:{self.proxy_port}",
+                    upstream=f"127.0.0.1:{self.server_port}",
                 )
 
-            self.toxiproxy.create_proxy(
-                name=self.proxy_name,
-                listen=f"127.0.0.1:{self.proxy_port}",
-                upstream=f"127.0.0.1:{self.server_port}",
-            )
             proxy_endpoint = f"http://127.0.0.1:{self.proxy_port}/mcp"
 
             # -------------------------------------------------------------
@@ -101,6 +112,7 @@ class G0Runner:
                 eval_res = oracle.evaluate_task(op_id, res.success, res.error_message, res.attempts_made)
                 baseline_results.append(eval_res)
                 details.append(eval_res)
+            await raw_client.close()
 
             # -------------------------------------------------------------
             # Phase B: Fault F1 (Response dropped after commit) with SDK retry
@@ -109,11 +121,19 @@ class G0Runner:
             f1_sdk_results = []
 
             for i in range(num_trials):
-                self.toxiproxy.clear_f1_response_drop(self.proxy_name)
+                if self.use_native_proxy:
+                    fault_proxy.clear_fault()
+                else:
+                    self.toxiproxy.clear_f1_response_drop(self.proxy_name)
+
                 sdk_retry_client = RawMCPClientAdapter(proxy_endpoint, max_retries=1, backoff_seconds=0.05)
                 await sdk_retry_client._ensure_initialized()
 
-                self.toxiproxy.setup_f1_response_drop(self.proxy_name, timeout_ms=10)
+                if self.use_native_proxy:
+                    fault_proxy.set_fault("f1_response_drop")
+                else:
+                    self.toxiproxy.setup_f1_response_drop(self.proxy_name, timeout_ms=10)
+
                 op_id = f"f1_sdk_tx_{uuid.uuid4().hex[:6]}"
                 res = await sdk_retry_client.execute_transfer(amount=100.0, recipient="Alice", memo=op_id)
                 await asyncio.sleep(0.05)
@@ -129,11 +149,19 @@ class G0Runner:
             f1_react_results = []
 
             for i in range(num_trials):
-                self.toxiproxy.clear_f1_response_drop(self.proxy_name)
+                if self.use_native_proxy:
+                    fault_proxy.clear_fault()
+                else:
+                    self.toxiproxy.clear_f1_response_drop(self.proxy_name)
+
                 react_client = ReActAgentAdapter(proxy_endpoint, max_agent_replans=1, sdk_retries=1)
                 await react_client._underlying_client._ensure_initialized()
 
-                self.toxiproxy.setup_f1_response_drop(self.proxy_name, timeout_ms=10)
+                if self.use_native_proxy:
+                    fault_proxy.set_fault("f1_response_drop")
+                else:
+                    self.toxiproxy.setup_f1_response_drop(self.proxy_name, timeout_ms=10)
+
                 op_id = f"f1_react_tx_{uuid.uuid4().hex[:6]}"
                 res = await react_client.execute_transfer(amount=150.0, recipient="Charlie", memo=op_id)
                 await asyncio.sleep(0.05)
@@ -143,7 +171,10 @@ class G0Runner:
                 await react_client._underlying_client.close()
 
             # Clean up toxic
-            self.toxiproxy.clear_f1_response_drop(self.proxy_name)
+            if self.use_native_proxy:
+                fault_proxy.clear_fault()
+            else:
+                self.toxiproxy.clear_f1_response_drop(self.proxy_name)
 
             # -------------------------------------------------------------
             # Compute Statistics
@@ -181,7 +212,14 @@ class G0Runner:
             )
 
         finally:
-            self.toxiproxy.delete_proxy(self.proxy_name)
+            if fault_proxy:
+                await fault_proxy.close()
+            if fault_srv:
+                fault_srv.should_exit = True
+            if fault_task:
+                await fault_task
+            if not self.use_native_proxy:
+                self.toxiproxy.delete_proxy(self.proxy_name)
             uvicorn_server.should_exit = True
             await server_task
 

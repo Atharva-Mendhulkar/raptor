@@ -106,3 +106,7 @@ class LangGraphAgentAdapter(BaseClientAdapter):
             attempts_made=state.attempts_made,
             meta={"graph_iterations": state.graph_iterations, "stack": "langgraph"},
         )
+
+    async def close(self) -> None:
+        if self._mcp_client:
+            await self._mcp_client.close()

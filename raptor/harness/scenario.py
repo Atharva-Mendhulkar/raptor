@@ -19,9 +19,15 @@ from pydantic import BaseModel, Field
 from raptor.analyzer.metrics import AnalysisReport, StatisticalAnalyzer
 from raptor.clients.raw_mcp_client import RawMCPClientAdapter
 from raptor.clients.react_agent import ReActAgentAdapter
+from raptor.clients.langgraph_adapter import LangGraphAgentAdapter
+from raptor.clients.openai_agent_adapter import OpenAIAgentsSDKAdapter
+from raptor.clients.a2a_adapter import A2AClientAdapter
+from raptor.clients.model_agent import ModelAgentAdapter
+from raptor.clients.durable_adapter import DurableExecutionAdapter
 from raptor.guard.ledger import GuardLedger
 from raptor.guard.policy import GuardPolicyConfig
 from raptor.guard.proxy import GuardProxyApp
+from raptor.harness.asgi_fault_proxy import ASGIFaultProxy
 from raptor.harness.oracle import EvaluationResult, Oracle
 from raptor.harness.toxiproxy import ToxiproxyController
 from raptor.server.ledger_db import LedgerDB
@@ -105,6 +111,53 @@ class ScenarioRunner:
         self.proxy_port = proxy_port
         self.toxiproxy = ToxiproxyController(toxiproxy_api)
         self.proxy_name = f"scenario_proxy_{config.seed}"
+        self.use_native_proxy = not self.toxiproxy.is_reachable()
+        self.asgi_fault_proxy: Optional[ASGIFaultProxy] = None
+        self.asgi_fault_srv: Optional[uvicorn.Server] = None
+        self.asgi_fault_task: Optional[asyncio.Task] = None
+
+    def _create_client(self, client_url: str):
+        stype = self.config.stack.type.lower()
+        if stype in ("react_agent", "react"):
+            return ReActAgentAdapter(
+                endpoint_url=client_url,
+                max_agent_steps=self.config.stack.max_retries + 1,
+                client_retries=1,
+            )
+        elif stype in ("langgraph", "langgraph_agent"):
+            return LangGraphAgentAdapter(
+                endpoint_url=client_url,
+                max_graph_iterations=self.config.stack.max_retries + 1,
+                sdk_retries=0,
+            )
+        elif stype in ("openai", "openai_agent", "openai_agents_sdk"):
+            return OpenAIAgentsSDKAdapter(
+                endpoint_url=client_url,
+                max_agent_turns=self.config.stack.max_retries + 1,
+            )
+        elif stype in ("a2a", "a2a_adapter"):
+            return A2AClientAdapter(
+                endpoint_url=client_url,
+                max_retries=self.config.stack.max_retries,
+            )
+        elif stype in ("model_agent", "w2"):
+            return ModelAgentAdapter(
+                endpoint_url=client_url,
+                max_re_plans=self.config.stack.max_retries,
+            )
+        elif stype in ("durable", "b4", "durable_execution"):
+            return DurableExecutionAdapter(
+                endpoint_url=client_url,
+                max_activity_retries=self.config.stack.max_retries,
+                workflow_id=f"wf_{self.config.seed}",
+            )
+        else:
+            return RawMCPClientAdapter(
+                endpoint_url=client_url,
+                max_retries=self.config.stack.max_retries,
+                backoff_seconds=self.config.stack.backoff_seconds,
+                timeout_seconds=self.config.stack.timeout_seconds,
+            )
 
     async def run(self) -> ScenarioResult:
         # Seed the deterministic pseudo-random generator
@@ -129,12 +182,26 @@ class ScenarioRunner:
         evaluations: List[EvaluationResult] = []
 
         try:
-            self.toxiproxy.delete_proxy(self.proxy_name)
-            self.toxiproxy.create_proxy(
-                name=self.proxy_name,
-                listen=f"127.0.0.1:{self.proxy_port}",
-                upstream=f"127.0.0.1:{self.server_port}",
-            )
+            if self.use_native_proxy:
+                self.asgi_fault_proxy = ASGIFaultProxy(
+                    upstream_url=f"http://127.0.0.1:{self.server_port}"
+                )
+                fault_cfg = uvicorn.Config(
+                    self.asgi_fault_proxy.as_asgi_app(),
+                    host="127.0.0.1",
+                    port=self.proxy_port,
+                    log_level="error",
+                )
+                self.asgi_fault_srv = uvicorn.Server(fault_cfg)
+                self.asgi_fault_task = asyncio.create_task(self.asgi_fault_srv.serve())
+                await asyncio.sleep(0.3)
+            else:
+                self.toxiproxy.delete_proxy(self.proxy_name)
+                self.toxiproxy.create_proxy(
+                    name=self.proxy_name,
+                    listen=f"127.0.0.1:{self.proxy_port}",
+                    upstream=f"127.0.0.1:{self.server_port}",
+                )
 
             proxy_url = f"http://127.0.0.1:{self.proxy_port}/mcp"
 
@@ -169,20 +236,7 @@ class ScenarioRunner:
                 # Deterministic memo derivation
                 memo = f"{self.config.workload.memo_prefix}_{self.config.seed}_{i}"
                 
-                # Client initialization
-                if self.config.stack.type == "react_agent":
-                    client = ReActAgentAdapter(
-                        endpoint_url=client_url,
-                        max_agent_steps=self.config.stack.max_retries + 1,
-                        client_retries=1,
-                    )
-                else:
-                    client = RawMCPClientAdapter(
-                        endpoint_url=client_url,
-                        max_retries=self.config.stack.max_retries,
-                        backoff_seconds=self.config.stack.backoff_seconds,
-                        timeout_seconds=self.config.stack.timeout_seconds,
-                    )
+                client = self._create_client(client_url)
 
                 # Initialize handshake while connection is clean
                 if hasattr(client, "_ensure_initialized"):
@@ -224,6 +278,8 @@ class ScenarioRunner:
 
                 # Clear fault before next iteration
                 self._clear_fault()
+                if hasattr(client, "close"):
+                    await client.close()
 
             total_committed = sum(e.committed_effects_count for e in evaluations)
             multiplicity = total_committed / float(self.config.repetitions) if self.config.repetitions else 0.0
@@ -258,13 +314,25 @@ class ScenarioRunner:
                 guard_srv.should_exit = True
             if guard_task:
                 await guard_task
-            self.toxiproxy.delete_proxy(self.proxy_name)
+            if self.asgi_fault_proxy:
+                await self.asgi_fault_proxy.close()
+            if self.asgi_fault_srv:
+                self.asgi_fault_srv.should_exit = True
+            if self.asgi_fault_task:
+                await self.asgi_fault_task
+            if not self.use_native_proxy:
+                self.toxiproxy.delete_proxy(self.proxy_name)
             srv.should_exit = True
             await server_task
 
     def _apply_fault(self) -> None:
         ftype = self.config.fault.type
         params = self.config.fault.parameters
+        if self.use_native_proxy:
+            if self.asgi_fault_proxy:
+                self.asgi_fault_proxy.set_fault(ftype, params)
+            return
+
         if ftype == "f1_response_drop":
             timeout_ms = params.get("timeout_ms", 10)
             self.toxiproxy.setup_f1_response_drop(self.proxy_name, timeout_ms=timeout_ms)
@@ -280,6 +348,11 @@ class ScenarioRunner:
             self.toxiproxy.setup_connection_reset(self.proxy_name, stream=stream)
 
     def _clear_fault(self) -> None:
+        if self.use_native_proxy:
+            if self.asgi_fault_proxy:
+                self.asgi_fault_proxy.clear_fault()
+            return
+
         self.toxiproxy.clear_f1_response_drop(self.proxy_name)
         self.toxiproxy.clear_f3_latency_jitter(self.proxy_name)
         self.toxiproxy.clear_f4_timeout(self.proxy_name)

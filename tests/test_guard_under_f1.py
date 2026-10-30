@@ -12,6 +12,7 @@ from raptor.clients.raw_mcp_client import RawMCPClientAdapter
 from raptor.guard.ledger import GuardLedger
 from raptor.guard.policy import GuardPolicyConfig
 from raptor.guard.proxy import GuardProxyApp
+from raptor.harness.asgi_fault_proxy import ASGIFaultProxy
 from raptor.harness.oracle import Oracle
 from raptor.harness.toxiproxy import ToxiproxyController
 from raptor.server.ledger_db import LedgerDB
@@ -22,14 +23,14 @@ from raptor.server.mock_tool_server import create_mock_mcp_server
 async def test_guard_eliminates_duplicates_under_f1():
     """
     Topology:
-    Client ---> [Toxiproxy (injects F1)] ---> [RAPTOR Guard Proxy] ---> [Backend Tool Server]
+    Client ---> [Fault Proxy (Toxiproxy or ASGIFaultProxy)] ---> [RAPTOR Guard Proxy] ---> [Backend Tool Server]
     
     1. First attempt:
-       - Forwarded through Toxiproxy to Guard.
+       - Forwarded through Fault Proxy to Guard.
        - Guard forwards to Tool Server.
        - Tool Server commits effect.
        - Guard records COMMITTED in its ledger and returns response.
-       - Toxiproxy drops the response back to Client (F1).
+       - Fault Proxy drops the response back to Client (F1).
     2. Client initiates retry (max_retries=1) with a fresh request ID.
     3. Retry reaches Guard:
        - Guard detects idempotency key in COMMITTED state.
@@ -39,12 +40,11 @@ async def test_guard_eliminates_duplicates_under_f1():
        - Backend ledger multiplicity == 1.00 (EXACTLY 1 commit, 0 duplicates!).
     """
     controller = ToxiproxyController()
-    if not controller.is_reachable():
-        pytest.skip("Toxiproxy daemon not running on localhost:8474")
+    use_toxiproxy = controller.is_reachable()
 
     server_port = 8931
     guard_port = 8932
-    toxiproxy_port = 8933
+    proxy_port = 8933
     proxy_name = "f1_guard_test_proxy"
 
     # 1. Upstream Tool Server
@@ -66,21 +66,29 @@ async def test_guard_eliminates_duplicates_under_f1():
     guard_task = asyncio.create_task(guard_srv.serve())
     await asyncio.sleep(0.35)
 
-    try:
-        # 3. Toxiproxy between Client and Guard Proxy
-        controller.delete_proxy(proxy_name)
-        controller.create_proxy(
-            name=proxy_name,
-            listen=f"127.0.0.1:{toxiproxy_port}",
-            upstream=f"127.0.0.1:{guard_port}",
-        )
+    fault_proxy = None
+    fault_srv = None
+    fault_task = None
 
-        client_url = f"http://127.0.0.1:{toxiproxy_port}/mcp"
+    try:
+        if use_toxiproxy:
+            controller.delete_proxy(proxy_name)
+            controller.create_proxy(
+                name=proxy_name,
+                listen=f"127.0.0.1:{proxy_port}",
+                upstream=f"127.0.0.1:{guard_port}",
+            )
+            controller.setup_f1_response_drop(proxy_name, timeout_ms=10)
+        else:
+            fault_proxy = ASGIFaultProxy(upstream_url=f"http://127.0.0.1:{guard_port}")
+            fault_proxy.set_fault("f1_response_drop")
+            fault_srv = uvicorn.Server(uvicorn.Config(fault_proxy.as_asgi_app(), host="127.0.0.1", port=proxy_port, log_level="error"))
+            fault_task = asyncio.create_task(fault_srv.serve())
+            await asyncio.sleep(0.3)
+
+        client_url = f"http://127.0.0.1:{proxy_port}/mcp"
         client = RawMCPClientAdapter(client_url, max_retries=1, backoff_seconds=0.05)
         await client._ensure_initialized()
-
-        # Inject Fault F1: cuts response after commit
-        controller.setup_f1_response_drop(proxy_name, timeout_ms=10)
 
         # Execute transfer with SDK retries enabled
         memo = "tx_guard_f1_protection"
@@ -105,13 +113,20 @@ async def test_guard_eliminates_duplicates_under_f1():
         assert eval_res.has_duplicate is False, "RAPTOR Guard failed to prevent duplicate backend commit!"
         assert eval_res.backend_multiplicity == 1.0
 
-        # Guard internal stats should confirm replay or coalescing
+        # Guard internal stats should confirm backend called exactly once
         assert guard.stats["upstream_forwards"] == 1, (
             f"Backend was called {guard.stats['upstream_forwards']} times instead of 1!"
         )
 
     finally:
-        controller.delete_proxy(proxy_name)
+        if use_toxiproxy:
+            controller.delete_proxy(proxy_name)
+        if fault_proxy:
+            await fault_proxy.close()
+        if fault_srv:
+            fault_srv.should_exit = True
+        if fault_task:
+            await fault_task
         await guard.close()
         guard_srv.should_exit = True
         srv.should_exit = True

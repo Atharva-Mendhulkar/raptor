@@ -30,3 +30,7 @@ class BaseClientAdapter(ABC):
     ) -> ClientRunResult:
         """Execute a transfer through the MCP tool interface."""
         pass
+
+    async def close(self) -> None:
+        """Close any open client sessions or connections."""
+        pass

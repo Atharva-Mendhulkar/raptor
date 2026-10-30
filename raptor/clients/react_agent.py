@@ -76,3 +76,7 @@ class ReActAgentAdapter(BaseClientAdapter):
             attempts_made=total_sdk_attempts,
             meta={"agent_steps": agent_step},
         )
+
+    async def close(self) -> None:
+        if self._underlying_client:
+            await self._underlying_client.close()

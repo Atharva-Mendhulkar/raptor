@@ -23,14 +23,13 @@ class RequestCoalescer:
         self._in_flight: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
 
-    async def execute(
+    async def run(
         self,
         key: str,
-        action: Callable[[], Awaitable[Tuple[int, bytes, Dict[str, str]]]],
-    ) -> Tuple[int, bytes, Dict[str, str], bool]:
+        action: Callable[[], Any],
+    ) -> Tuple[Any, bool]:
         """
-        Executes the action or joins an already in-flight execution for `key`.
-        Returns (status_code, body_bytes, headers_dict, was_coalesced: bool).
+        Generic singleflight coalescing returning (result, was_coalesced: bool).
         """
         async with self._lock:
             if key in self._in_flight:
@@ -44,16 +43,14 @@ class RequestCoalescer:
                 is_leader = True
 
         if not is_leader:
-            # Follower: wait for leader result
             res = await future
-            return res[0], res[1], res[2], True
+            return res, True
 
-        # Leader: execute action
         try:
             result = await action()
             if not future.done():
                 future.set_result(result)
-            return result[0], result[1], result[2], False
+            return result, False
         except Exception as exc:
             if not future.done():
                 future.set_exception(exc)
@@ -61,3 +58,18 @@ class RequestCoalescer:
         finally:
             async with self._lock:
                 self._in_flight.pop(key, None)
+            # Acknowledge future exception so asyncio doesn't warn if there were no followers
+            if future.done() and not future.cancelled() and future.exception():
+                pass
+
+    async def execute(
+        self,
+        key: str,
+        action: Callable[[], Awaitable[Tuple[int, bytes, Dict[str, str]]]],
+    ) -> Tuple[int, bytes, Dict[str, str], bool]:
+        """
+        Executes HTTP action or joins an already in-flight execution for `key`.
+        Returns (status_code, body_bytes, headers_dict, was_coalesced: bool).
+        """
+        res, was_coalesced = await self.run(key, action)
+        return res[0], res[1], res[2], was_coalesced
